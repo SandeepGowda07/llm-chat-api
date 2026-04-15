@@ -1,11 +1,12 @@
 # ============================================================
 # CI/CD Pipeline — llm-chat-api
-# Triggers on every push to main branch
+# Triggers on every push / PR to main branch
 #
 # Jobs:
-#   1. test   — install deps & run basic health smoke test
-#   2. build  — build Docker image & push to Docker Hub
-#   3. deploy — apply k8s manifests with the new image tag
+#   1. test   — pytest unit tests with coverage
+#   2. scan   — Trivy container image security scan
+#   3. build  — build Docker image & push to Docker Hub
+#   4. deploy — apply k8s manifests with the new image tag
 # ============================================================
 
 name: CI/CD Pipeline
@@ -25,8 +26,7 @@ jobs:
 
   # ----------------------------------------------------------
   # JOB 1 — Test
-  # Install Python dependencies and run a basic import/smoke
-  # test to catch obvious breakage before building an image.
+  # Run pytest unit tests and print a coverage summary.
   # ----------------------------------------------------------
   test:
     name: Test
@@ -44,13 +44,38 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Smoke test — import app module
-        run: python -c "from app.main import app; print('App imported successfully')"
+      - name: Run tests with coverage
+        run: pytest tests/ -v --tb=short --cov=app --cov-report=term-missing
         env:
-          GROQ_API_KEY: "dummy-key-for-import-test"
+          GROQ_API_KEY: "dummy-key-for-tests"
 
   # ----------------------------------------------------------
-  # JOB 2 — Build & Push Docker Image
+  # JOB 2 — Security Scan
+  # Build the image locally (no push) and scan it with Trivy
+  # for known CVEs. Fails the pipeline on CRITICAL issues.
+  # Runs in parallel with tests to save time.
+  # ----------------------------------------------------------
+  scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build image locally for scanning
+        run: docker build -t ${{ env.IMAGE_NAME }}:scan-target .
+
+      - name: Scan image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:scan-target
+          format: table
+          exit-code: "1"          # fail pipeline on findings
+          severity: CRITICAL      # only block on CRITICAL CVEs
+
+  # ----------------------------------------------------------
+  # JOB 3 — Build & Push Docker Image
   # Runs only on push to main (not on PRs).
   # Tags the image with:
   #   - latest
@@ -59,7 +84,7 @@ jobs:
   build:
     name: Build & Push Docker Image
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, scan]           # both must pass before building
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
 
     outputs:
@@ -92,8 +117,13 @@ jobs:
 
   # ----------------------------------------------------------
   # JOB 3 — Deploy to Kubernetes
-  # Updates the k8s Deployment to use the newly pushed image.
-  # Requires KUBECONFIG secret to be set (base64-encoded).
+  # 1. Creates the groq-secret if it doesn't exist yet
+  # 2. Applies all k8s manifests (creates resources if missing,
+  #    updates them if they already exist — idempotent)
+  # 3. Updates the Deployment image to the exact SHA tag
+  # 4. Waits for the rollout to finish
+  #
+  # Requires secrets: KUBECONFIG, GROQ_API_KEY
   # ----------------------------------------------------------
   deploy:
     name: Deploy to Kubernetes
@@ -112,8 +142,21 @@ jobs:
           echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
           chmod 600 $HOME/.kube/config
 
-      # Update the image in the Deployment to the exact SHA tag
-      - name: Update image in Kubernetes
+      # Create the groq-secret in k8s if it doesn't exist yet.
+      # --dry-run=client + apply makes this safe to re-run.
+      - name: Create groq-secret (if not exists)
+        run: |
+          kubectl create secret generic groq-secret \
+            --from-literal=GROQ_API_KEY=${{ secrets.GROQ_API_KEY }} \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # Apply all manifests — kubectl apply is idempotent:
+      # creates resources on first run, updates on subsequent runs
+      - name: Apply k8s manifests
+        run: kubectl apply -f k8s/
+
+      # Now update the Deployment image to the exact SHA tag built above
+      - name: Update image to new version
         run: |
           kubectl set image deployment/llm-chat-api \
             llm-chat-api=${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image_tag }}
