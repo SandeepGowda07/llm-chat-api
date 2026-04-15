@@ -1,0 +1,17 @@
+# Python
+.env
+__pycache__/
+*.pyc
+.venv/
+
+# Terraform
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/terraform.tfvars
+*.tfstate
+*.tfstate.backup
+
+# Kubeconfig (never commit this)
+kubeconfig
+*.kubeconfig

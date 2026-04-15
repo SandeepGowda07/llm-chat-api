@@ -1,0 +1,37 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-chat-api
+spec:
+  replicas: 1               # run 1 copy of the app
+  selector:
+    matchLabels:
+      app: llm-chat-api     # links to the pods below
+  template:
+    metadata:
+      labels:
+        app: llm-chat-api   # label on each pod
+    spec:
+      containers:
+        - name: llm-chat-api
+          image: sandeepagowda/llm-chat-api:latest  # your Docker Hub image
+          ports:
+            - containerPort: 8000
+          env:
+            - name: GROQ_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: groq-secret   # kubernetes secret we created
+                  key: GROQ_API_KEY
+          livenessProbe:              # k8s checks if app is alive
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          readinessProbe:             # k8s checks if app is ready for traffic
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
