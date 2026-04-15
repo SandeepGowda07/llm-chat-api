@@ -1,29 +1,65 @@
-# Tell Terraform to use AWS
+# ============================================================
+# Terraform — EKS Cluster for llm-chat-api
+#
+# Resources created:
+#   Networking  : VPC, 2 Subnets (different AZs), IGW, Route Table
+#   IAM         : Cluster Role, Node Role + policy attachments
+#   Kubernetes  : EKS Cluster, EKS Node Group
+# ============================================================
+
 provider "aws" {
   region = var.aws_region
 }
 
-# Create a VPC - your private network
+# ─── NETWORKING ───────────────────────────────────────────────────────────────
+#
+# VPC = your private network in AWS.
+# enable_dns_hostnames and enable_dns_support are required by EKS
+# so that nodes can resolve each other by hostname.
+
 resource "aws_vpc" "main" {
-  cidr_block = "10.0.0.0/16"
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
 
   tags = {
     Name = "llm-chat-vpc"
   }
 }
 
-# Create a subnet inside the VPC
-resource "aws_subnet" "main" {
+# EKS requires at least 2 subnets in DIFFERENT Availability Zones.
+# Why? So if one data centre (AZ) goes down, your cluster still runs.
+# AZ "a" and AZ "b" are physically separate buildings in the same region.
+
+resource "aws_subnet" "subnet_1" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.1.0/24"
-  map_public_ip_on_launch = true  # auto-assign public IP
+  availability_zone       = "${var.aws_region}a"
+  map_public_ip_on_launch = true
 
+  # These tags tell EKS which subnets belong to this cluster,
+  # and tell AWS to use these subnets when creating Load Balancers.
   tags = {
-    Name = "llm-chat-subnet"
+    Name                                        = "llm-chat-subnet-1"
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
+    "kubernetes.io/role/elb"                    = "1"
   }
 }
 
-# Internet Gateway - connects VPC to the internet
+resource "aws_subnet" "subnet_2" {
+  vpc_id                  = aws_vpc.main.id
+  cidr_block              = "10.0.2.0/24"
+  availability_zone       = "${var.aws_region}b"
+  map_public_ip_on_launch = true
+
+  tags = {
+    Name                                        = "llm-chat-subnet-2"
+    "kubernetes.io/cluster/${var.cluster_name}" = "shared"
+    "kubernetes.io/role/elb"                    = "1"
+  }
+}
+
+# Internet Gateway connects the VPC to the public internet.
 resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
 
@@ -32,13 +68,13 @@ resource "aws_internet_gateway" "main" {
   }
 }
 
-# Route Table - tells traffic where to go
+# Route Table says: all traffic (0.0.0.0/0) goes to the internet gateway.
 resource "aws_route_table" "main" {
   vpc_id = aws_vpc.main.id
 
   route {
-    cidr_block = "0.0.0.0/0"           # all traffic
-    gateway_id = aws_internet_gateway.main.id  # goes to internet
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.main.id
   }
 
   tags = {
@@ -46,82 +82,135 @@ resource "aws_route_table" "main" {
   }
 }
 
-# Associate route table with subnet
-resource "aws_route_table_association" "main" {
-  subnet_id      = aws_subnet.main.id
+# Associate the route table with BOTH subnets so both can reach the internet.
+resource "aws_route_table_association" "subnet_1" {
+  subnet_id      = aws_subnet.subnet_1.id
   route_table_id = aws_route_table.main.id
 }
 
-# Security Group - firewall rules
-resource "aws_security_group" "main" {
-  vpc_id = aws_vpc.main.id
-  name   = "llm-chat-sg"
-
-  # Allow SSH
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # Allow HTTP
-  ingress {
-    from_port   = 80
-    to_port     = 80
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # Allow FastAPI app
-  ingress {
-    from_port   = 8000
-    to_port     = 8000
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # Allow Kubernetes API
-  ingress {
-    from_port   = 6443
-    to_port     = 6443
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  # Allow all outbound traffic
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
-  }
-
-  tags = {
-    Name = "llm-chat-sg"
-  }
+resource "aws_route_table_association" "subnet_2" {
+  subnet_id      = aws_subnet.subnet_2.id
+  route_table_id = aws_route_table.main.id
 }
 
-# EC2 Instance - your actual server
-resource "aws_instance" "main" {
-  ami                    = "ami-0faab6bdbac9486fb"  # Ubuntu 22.04 in eu-central-1
-  instance_type          = var.instance_type
-  subnet_id              = aws_subnet.main.id
-  vpc_security_group_ids = [aws_security_group.main.id]
-  key_name               = aws_key_pair.main.key_name
+# ─── IAM ROLES ────────────────────────────────────────────────────────────────
+#
+# AWS uses IAM (Identity and Access Management) to control what can do what.
+# EKS needs TWO separate roles:
+#
+# 1. CLUSTER ROLE — used by the EKS control plane itself.
+#    It needs permission to manage ENIs (network interfaces), security groups,
+#    and load balancers on your behalf.
+#
+# 2. NODE ROLE — used by the EC2 worker nodes.
+#    They need permission to pull images, register with the cluster,
+#    and manage pod networking.
+#
+# "assume_role_policy" = who is allowed to USE this role.
+# In role 1: the EKS service (eks.amazonaws.com) can use it.
+# In role 2: EC2 instances (ec2.amazonaws.com) can use it.
 
-  # Script that runs automatically when server starts
-  user_data = templatefile("user_data.sh", {
-    groq_api_key = var.groq_api_key
+resource "aws_iam_role" "eks_cluster_role" {
+  name = "${var.cluster_name}-cluster-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "eks.amazonaws.com" }
+    }]
   })
-
-  tags = {
-    Name = "llm-chat-server"
-  }
 }
 
-# SSH Key Pair - so you can SSH into the server
-resource "aws_key_pair" "main" {
-  key_name   = "llm-chat-key"
-  public_key = file("~/.ssh/id_rsa.pub")  # uses your existing SSH key
+# Attach AWS's managed policy that gives EKS the permissions it needs.
+resource "aws_iam_role_policy_attachment" "eks_cluster_policy" {
+  role       = aws_iam_role.eks_cluster_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+}
+
+# Node role — for the EC2 worker nodes.
+resource "aws_iam_role" "eks_node_role" {
+  name = "${var.cluster_name}-node-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action    = "sts:AssumeRole"
+      Effect    = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
+  })
+}
+
+# Three policies the worker nodes need:
+# 1. WorkerNodePolicy      — lets nodes register with the EKS cluster
+# 2. CNI_Policy            — lets nodes manage pod networking (IP addresses)
+# 3. ContainerRegistryRead — lets nodes pull images from ECR (or Docker Hub)
+resource "aws_iam_role_policy_attachment" "eks_worker_node_policy" {
+  role       = aws_iam_role.eks_node_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+}
+
+resource "aws_iam_role_policy_attachment" "eks_cni_policy" {
+  role       = aws_iam_role.eks_node_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+}
+
+resource "aws_iam_role_policy_attachment" "eks_container_registry_policy" {
+  role       = aws_iam_role.eks_node_role.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+}
+
+# ─── EKS CLUSTER ──────────────────────────────────────────────────────────────
+#
+# This creates the Kubernetes CONTROL PLANE — the "brain" of the cluster.
+# AWS manages the master nodes (API server, scheduler, etcd) for you.
+# You never SSH into them. You just talk to the API endpoint.
+#
+# depends_on ensures the IAM role has its policies attached BEFORE
+# the cluster is created — otherwise EKS starts without permissions.
+
+resource "aws_eks_cluster" "main" {
+  name     = var.cluster_name
+  role_arn = aws_iam_role.eks_cluster_role.arn
+
+  vpc_config {
+    subnet_ids = [aws_subnet.subnet_1.id, aws_subnet.subnet_2.id]
+  }
+
+  depends_on = [aws_iam_role_policy_attachment.eks_cluster_policy]
+}
+
+# ─── EKS NODE GROUP ───────────────────────────────────────────────────────────
+#
+# Node Group = the EC2 instances that actually RUN your pods.
+# AWS manages them — if a node crashes, AWS replaces it automatically.
+#
+# scaling_config:
+#   desired_size = how many nodes to run normally (1 = cheapest)
+#   min_size     = never go below this (1 = always have at least 1 node)
+#   max_size     = never exceed this (2 = can scale up if needed)
+#
+# depends_on ensures ALL three node policies are attached before
+# nodes try to join the cluster.
+
+resource "aws_eks_node_group" "main" {
+  cluster_name    = aws_eks_cluster.main.name
+  node_group_name = "${var.cluster_name}-nodes"
+  node_role_arn   = aws_iam_role.eks_node_role.arn
+  subnet_ids      = [aws_subnet.subnet_1.id, aws_subnet.subnet_2.id]
+  instance_types  = [var.instance_type]
+
+  scaling_config {
+    desired_size = 1
+    max_size     = 2
+    min_size     = 1
+  }
+
+  depends_on = [
+    aws_iam_role_policy_attachment.eks_worker_node_policy,
+    aws_iam_role_policy_attachment.eks_cni_policy,
+    aws_iam_role_policy_attachment.eks_container_registry_policy,
+  ]
 }

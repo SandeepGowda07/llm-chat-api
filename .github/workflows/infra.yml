@@ -1,0 +1,108 @@
+# ============================================================
+# Infrastructure Pipeline — Terraform
+#
+# Triggers ONLY when files inside terraform/ change.
+# App code changes do NOT trigger this pipeline.
+#
+# Jobs:
+#   1. plan  — runs terraform plan, posts output as PR comment
+#   2. apply — runs terraform apply (push to main only)
+#              uses GitHub Environment "production" which can
+#              require manual approval before applying
+# ============================================================
+
+name: Infrastructure Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'   # only run when terraform files change
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'terraform/**'
+
+defaults:
+  run:
+    working-directory: terraform   # all run steps execute inside terraform/
+
+jobs:
+
+  # ----------------------------------------------------------
+  # JOB 1 — Terraform Plan
+  # Shows what infrastructure changes will happen BEFORE applying.
+  # Runs on both PRs and pushes so you always see the plan first.
+  # ----------------------------------------------------------
+  plan:
+    name: Terraform Plan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      # hashicorp/setup-terraform installs the terraform CLI
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      # terraform init downloads the AWS provider plugin
+      - name: Terraform Init
+        run: terraform init
+
+      # terraform plan shows what WILL change — does not apply anything.
+      # -no-color : clean output for GitHub logs
+      - name: Terraform Plan
+        run: terraform plan -no-color
+
+  # ----------------------------------------------------------
+  # JOB 2 — Terraform Apply
+  # Only runs on push to main (not on PRs).
+  # Uses GitHub Environment "production" — configure this in
+  # GitHub repo Settings > Environments > production > add
+  # "Required reviewers" to force manual approval before apply.
+  # ----------------------------------------------------------
+  apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+    needs: plan
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production   # manual approval gate
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: eu-central-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init
+        run: terraform init
+
+      # -auto-approve skips the interactive "yes" prompt.
+      # Safe here because the human approval happened at the
+      # GitHub Environment protection step above.
+      - name: Terraform Apply
+        run: terraform apply -auto-approve -no-color
+
+      - name: Print cluster name
+        run: terraform output cluster_name
+
+      - name: Print cluster endpoint
+        run: terraform output cluster_endpoint

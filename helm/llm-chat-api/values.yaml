@@ -1,0 +1,30 @@
+# Default values for llm-chat-api.
+# These can be overridden at deploy time with --set or --values flag.
+
+image:
+  repository: sandeepagowda/llm-chat-api
+  tag: latest          # overridden in CI/CD with the exact SHA tag
+  pullPolicy: Always   # always pull latest — important for :latest tag
+
+replicaCount: 1
+
+service:
+  type: LoadBalancer   # AWS auto-provisions an ELB
+  port: 80             # ELB listens on this
+  targetPort: 8000     # forwards to pod on this port
+
+# Resource limits prevent a single pod from starving the node.
+# requests = guaranteed minimum   limits = hard ceiling
+resources:
+  requests:
+    memory: "128Mi"
+    cpu: "125m"
+  limits:
+    memory: "256Mi"
+    cpu: "250m"
+
+# Health check paths — used by liveness and readiness probes
+healthCheck:
+  path: /health
+  initialDelaySeconds: 10
+  periodSeconds: 10

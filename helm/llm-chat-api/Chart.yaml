@@ -1,0 +1,6 @@
+apiVersion: v2
+name: llm-chat-api
+description: A cloud-native LLM Chat API deployed on EKS
+type: application
+version: 0.1.0      # chart version — bump this when you change the chart
+appVersion: "1.0.0" # app version — informational only

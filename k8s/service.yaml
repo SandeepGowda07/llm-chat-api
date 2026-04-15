@@ -4,9 +4,14 @@ metadata:
   name: llm-chat-api-service
 spec:
   selector:
-    app: llm-chat-api       # finds pods with this label
+    app: llm-chat-api
   ports:
     - protocol: TCP
-      port: 80              # service listens on port 80
-      targetPort: 8000      # forwards to pod's port 8000
-  type: ClusterIP           # internal only, Ingress handles external
+      port: 80           # ELB listens on port 80
+      targetPort: 8000   # forwards to your pod on 8000
+  type: LoadBalancer
+  # When type is LoadBalancer on EKS, AWS automatically:
+  # 1. Provisions a Classic Load Balancer (ELB)
+  # 2. Assigns it a public DNS hostname
+  # 3. Routes traffic from port 80 → your pod's port 8000
+  # You find the hostname under: kubectl get svc → EXTERNAL-IP column
